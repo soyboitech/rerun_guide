@@ -1,0 +1,930 @@
+package com.rerunguide.core
+
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.ZonedDateTime
+import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.floor
+
+/** Turns a flat library into channel definitions and resolves definitions back into items. */
+object ChannelBuilder {
+    /**
+     * The automatic channel lineup. Up front, when the library has enough for them: New Releases (films from this year and last),
+     * New This Season (TV from this year and last), Just Added (anything added in the last 60 days), Unwatched (films the
+     * signed-in user hasn't seen), then the classic channels (TV and films from before 1970). After that every genre, theme,
+     * marathon, director, actor and year channel, scattered with a fixed seed so the lineup feels like cable, not an
+     * alphabetical list, yet is identical on every device.
+     * Genre channels get retro names ("Studio Audience", "Gumshoe", "Toon Block"); unknown genres keep their own name.
+     * No channel mixes films and TV: a genre gets a films channel with ≥ `minItems` films and a TV channel with
+     * ≥ `minItems` episodes, and director, actor and year channels are films. Only the biggest groups make the lineup
+     * (`maxSeries` marathons, `maxPeople` directors and actors, 3 years).
+     */
+    fun automaticChannels(from: List<MediaItem>, minItems: Int = 4, maxSeries: Int = 24, maxPeople: Int = 12,
+                          now: Instant = Instant.now()): List<ChannelDefinition> {
+        val library = from
+        fun def(id: String, name: String, tag: String, rule: List<RuleChip>, order: PlayOrder = PlayOrder.shuffle) =
+            ChannelDefinition(id = id, number = 0, name = name, tag = tag, rule = rule, order = order)
+        fun span(items: List<MediaItem>): List<RuleChip> {
+            val years = items.mapNotNull { it.year }
+            return if (years.isEmpty()) emptyList() else listOf(RuleChip.years(years.min() / 10 * 10, years.max()))
+        }
+        fun count(rule: List<RuleChip>): Int = library.count { i -> rule.all { matches(it, i, now) } }
+
+        // Lead channels.
+        val year = now.atZone(ZoneId.systemDefault()).year
+        val lead = mutableListOf<ChannelDefinition>()
+        for ((id, name, tag, rule, order) in listOf(
+            Lead("lead:new-movies", "New Releases", "Films from ${year - 1}–$year", listOf(RuleChip.years(year - 1, year), RuleChip.movies), PlayOrder.newestFirst),
+            Lead("lead:new-tv", "New This Season", "TV from ${year - 1}–$year", listOf(RuleChip.years(year - 1, year), RuleChip.tv), PlayOrder.shuffle),
+            Lead("lead:just-added", "Just Added", "Films new on the server", listOf(RuleChip.addedWithin(days = 60), RuleChip.movies), PlayOrder.shuffle),
+            Lead("lead:unwatched", "Unwatched", "Films you haven’t seen", listOf(RuleChip.unwatched, RuleChip.movies), PlayOrder.shuffle),
+            Lead("lead:just-added-tv", "Fresh Episodes", "TV new on the server", listOf(RuleChip.addedWithin(days = 60), RuleChip.tv), PlayOrder.shuffle),
+            Lead("lead:classic-tv", "Front Porch", "Classic TV, before 1970", listOf(RuleChip.years(1900, 1969), RuleChip.tv), PlayOrder.shuffle),
+            Lead("lead:classic-movies", "The Vault", "Classic films, before 1970", listOf(RuleChip.years(1900, 1969), RuleChip.movies), PlayOrder.shuffle),
+        )) if (count(rule) >= minItems) lead.add(def(id, name, tag, rule, order = order))
+
+        val byGenre = LinkedHashMap<String, MutableList<MediaItem>>()
+        val bySeries = LinkedHashMap<String, Pair<String, MutableList<MediaItem>>>()
+        val byDirector = LinkedHashMap<String, Int>()
+        val byActor = LinkedHashMap<String, Int>()
+        val byYear = LinkedHashMap<Int, Int>()
+        for (item in library) {
+            for (g in item.genres) byGenre.getOrPut(g) { mutableListOf() }.add(item)
+            when (item.kind) {
+                MediaItem.Kind.episode -> {
+                    val key = item.seriesID ?: item.seriesTitle ?: continue
+                    bySeries.getOrPut(key) { (item.seriesTitle ?: key) to mutableListOf() }.second.add(item)
+                }
+                MediaItem.Kind.movie -> {
+                    for (d in item.directors) byDirector[d] = (byDirector[d] ?: 0) + 1
+                    for (a in item.actors) byActor[a] = (byActor[a] ?: 0) + 1
+                    item.year?.let { y -> byYear[y] = (byYear[y] ?: 0) + 1 }
+                }
+            }
+        }
+
+        var genres = mutableListOf<ChannelDefinition>()
+        for ((g, all) in byGenre) {
+            if (all.size < minItems) continue
+            val items = all.filter { matches(RuleChip.genre(g), it, now) }   // what the channel will really air (kids' titles leave horror)
+            val movies = items.filter { it.kind == MediaItem.Kind.movie }
+            val eps = items.filter { it.kind == MediaItem.Kind.episode }
+            if (movies.size >= minItems) {
+                val (mn, md) = retroName(g, ShelfKind.movies)
+                genres.add(def("genre:$g:movies", mn, decadeTag(md, movies.mapNotNull { it.year }), listOf(RuleChip.genre(g)) + span(movies) + RuleChip.movies))
+            }
+            if (eps.size >= minItems) {
+                val (tn, td) = retroName(g, ShelfKind.tv)
+                genres.add(def("genre:$g:tv", tn, decadeTag(td, eps.mapNotNull { it.year }), listOf(RuleChip.genre(g)) + span(eps) + RuleChip.tv))
+            }
+        }
+        // Two channels with the same retro name (two genres mapping to one, or a genre missing from the table) get told apart by what's on them.
+        val dupes = genres.groupBy { it.name }.filter { it.value.size > 1 }.keys
+        genres = genres.map { gd ->
+            if (gd.name !in dupes) return@map gd
+            val kind = if (RuleChip.tv in gd.rule) "TV" else if (RuleChip.movies in gd.rule) "Films"
+                else gd.id.split(":").filter { it.isNotEmpty() }.drop(1).firstOrNull() ?: ""
+            gd.copy(name = gd.name + " ($kind)")
+        }.toMutableList()
+        // Themed channels: a keyword search within a few related genres, for what no genre tag covers.
+        val themes = listOf(
+            def("theme:monsters", "Creature Feature", "Monster movies",
+                listOf(RuleChip.movies, RuleChip.anyGenre(monsterGenres), RuleChip.keywords(monsterWords))),
+        ).filter { count(it.rule) >= minItems }
+        val series = bySeries.entries.filter { it.value.second.size >= minItems }
+            .sortedWith { a, b -> if (a.value.second.size != b.value.second.size) b.value.second.size - a.value.second.size else swiftCompare(a.key, b.key) }
+            .take(maxSeries).map {
+                def("series:${it.key}", it.value.first, "Marathon", listOf(RuleChip.series(id = it.key, title = it.value.first)), order = PlayOrder.inOrder)
+            }
+        fun top(counts: Map<String, Int>): List<String> =
+            counts.entries.filter { it.value >= minItems }
+                .sortedWith { a, b -> if (a.value != b.value) b.value - a.value else swiftCompare(a.key, b.key) }
+                .take(maxPeople).map { it.key }
+        val directors = top(byDirector).map { def("director:$it", it, "Director", listOf(RuleChip.director(it), RuleChip.movies)) }
+        val actors = top(byActor).map { def("actor:$it", it, "Actor", listOf(RuleChip.actor(it), RuleChip.movies)) }
+        val years = byYear.entries.filter { it.value >= minItems }
+            .sortedWith { a, b -> if (a.value != b.value) b.value - a.value else a.key.compareTo(b.key) }.take(3)
+            .map { def("year:${it.key}", "Class of ’" + String.format(Locale.ROOT, "%02d", it.key % 100), "Films from ${it.key}", listOf(RuleChip.year(it.key), RuleChip.movies)) }
+
+        // Scatter the rest with a fixed seed: same channels → same order on every device and launch.
+        val rng = SeededGenerator(seed = "retro-binge-dial")
+        val rest = (genres + themes + series + directors + actors + years).sortedWith { a, b -> swiftCompare(a.id, b.id) }.shuffled(using = rng)
+        val all = (lead + rest).toMutableList()
+        // Last, so it renumbers nothing: films for the nearest holiday, picked day by day (`Holiday`). The tag stays put:
+        // a lineup built on February 1 can still be up on the 2nd.
+        if (Holiday.entries.any { h -> library.count(h::has) >= maxOf(minItems, Holiday.minFilms) }) {
+            all.add(def("holiday", "Holiday Special", "Films for the nearest holiday", listOf(RuleChip.holiday)))
+        }
+        var n = 0
+        for (i in all.indices) {
+            n = if (i == 0) 2 else n + 1 + (StableHash.fnv1a(all[i].id) % 3u).toInt()
+            if (n == Channel.scrambledNumber) n += 1   // 99 belongs to the scrambled channel
+            all[i] = all[i].copy(number = n)
+        }
+        return all
+    }
+
+    private data class Lead(val id: String, val name: String, val tag: String, val rule: List<RuleChip>, val order: PlayOrder)
+
+    internal enum class ShelfKind { movies, tv, mixed }
+
+    private data class Names(val movies: Pair<String, String>, val tv: Pair<String, String>, val mixed: Pair<String, String>)
+    private fun n(mn: String, md: String, tn: String, td: String, xn: String, xd: String) = Names(mn to md, tn to td, xn to xd)
+
+    private val retroTable: Map<String, Names> = mapOf(
+        "action" to n("Adrenaline", "Action films", "Stunt Hour", "Action TV", "Adrenaline", "Action"),
+        "action & adventure" to n("Thrill Ride", "Action & adventure films", "Thrill Ride", "Action & adventure TV", "Thrill Ride", "Action & adventure"),
+        "adventure" to n("The Matinee", "Adventure films", "Wide World", "Adventure TV", "The Matinee", "Adventure"),
+        "animation" to n("The Big Cartoon", "Animated films", "Toon Block", "Cartoons", "Toon Block", "Animation"),
+        "anime" to n("Anime Features", "Anime films", "Anime Block", "Anime", "Anime Block", "Anime"),
+        "biography" to n("Life Stories", "Biopics", "Portraits", "Biographies", "Life Stories", "Biographies"),
+        "children" to n("Kids’ Matinee", "Kids’ films", "After School", "Kids’ TV", "After School", "Kids"),
+        "kids" to n("Kids’ Matinee", "Kids’ films", "After School", "Kids’ TV", "After School", "Kids"),
+        "comedy" to n("Funny Business", "Comedy films", "Studio Audience", "Sitcoms", "Studio Audience", "Comedy"),
+        "crime" to n("Mean Streets", "Crime films", "Gumshoe", "Detectives", "Gumshoe", "Crime"),
+        "documentary" to n("True Stories", "Documentaries", "Field Notes", "Documentary TV", "True Stories", "Documentaries"),
+        "drama" to n("The Picture Show", "Drama films", "Prime Time", "Drama series", "Prime Time", "Drama"),
+        "family" to n("Family Hour", "Family films", "Family Room", "Family TV", "Family Hour", "Family"),
+        "fantasy" to n("Once Upon", "Fantasy films", "The Realm", "Fantasy TV", "Once Upon", "Fantasy"),
+        "food" to n("Dinner Bell", "Food", "Dinner Bell", "Food TV", "Dinner Bell", "Food"),
+        "game show" to n("Game Night", "Game shows", "Game Night", "Game shows", "Game Night", "Game shows"),
+        "history" to n("Days Gone By", "History films", "The Archive", "History TV", "Days Gone By", "History"),
+        "holiday" to n("Yule Log", "Holiday films", "Tinsel Time", "Holiday TV", "Yule Log", "Holiday"),
+        "home and garden" to n("Open House", "Home & garden", "Open House", "Home & garden", "Open House", "Home & garden"),
+        "horror" to n("Fright Night", "Horror films", "Chiller", "Horror TV", "Fright Night", "Horror"),
+        "martial arts" to n("Kung Fu Theater", "Martial arts", "Kung Fu Theater", "Martial arts", "Kung Fu Theater", "Martial arts"),
+        "mini-series" to n("The Miniseries", "Mini-series", "The Miniseries", "Mini-series", "The Miniseries", "Mini-series"),
+        "music" to n("The Jukebox", "Music films", "Video Hour", "Music TV", "The Jukebox", "Music"),
+        "musical" to n("Showtunes", "Musicals", "Showtunes", "Musicals", "Showtunes", "Musicals"),
+        "mystery" to n("Whodunit", "Mystery films", "Case Files", "Mystery TV", "Whodunit", "Mysteries"),
+        "news" to n("Newsroom", "News", "Newsroom", "News", "Newsroom", "News"),
+        "reality" to n("Real Life", "Reality TV", "Real Life", "Reality TV", "Real Life", "Reality TV"),
+        "romance" to n("Date Night", "Romance films", "Love Lines", "Romance TV", "Date Night", "Romance"),
+        "sci-fi" to n("Final Frontier", "Sci-fi films", "Space Age", "Sci-fi TV", "Space Age", "Sci-fi"),
+        "science fiction" to n("Final Frontier", "Sci-fi films", "Space Age", "Sci-fi TV", "Space Age", "Sci-fi"),
+        "soap" to n("Daytime", "Soaps", "Daytime", "Soaps", "Daytime", "Soaps"),
+        "sport" to n("Game Day", "Sports films", "Sports Desk", "Sports TV", "Game Day", "Sports"),
+        "sports" to n("Game Day", "Sports films", "Sports Desk", "Sports TV", "Game Day", "Sports"),
+        "superhero" to n("Capes & Cowls", "Superhero films", "Secret Identity", "Superhero TV", "Capes & Cowls", "Superheroes"),
+        "suspense" to n("Nail Biter", "Suspense films", "Held Breath", "Suspense TV", "Nail Biter", "Suspense"),
+        "talk show" to n("Late Night", "Talk shows", "Late Night", "Talk shows", "Late Night", "Talk shows"),
+        "thriller" to n("Edge of Your Seat", "Thrillers", "Cliffhanger", "Thriller TV", "Edge of Your Seat", "Thrillers"),
+        "travel" to n("Passport", "Travel films", "Road Trip", "Travel TV", "Passport", "Travel"),
+        "war" to n("The Front", "War films", "War Room", "War TV", "The Front", "War"),
+        "western" to n("Dusty Trails", "Westerns", "The Frontier", "Western TV", "Dusty Trails", "Westerns"),
+    )
+
+    /**
+     * Retro channel names for the common genres ("Studio Audience", "Gumshoe"). Returns (name, descriptor);
+     * the descriptor becomes the tag with the decade span appended. Unknown genres fall back to the genre itself.
+     */
+    internal fun retroName(genre: String, kind: ShelfKind): Pair<String, String> {
+        val e = retroTable[genre.lowercase()]
+        if (e != null) return when (kind) { ShelfKind.movies -> e.movies; ShelfKind.tv -> e.tv; ShelfKind.mixed -> e.mixed }
+        return when (kind) {
+            ShelfKind.movies -> "$genre Movies" to "$genre films"
+            ShelfKind.tv -> "$genre TV" to "$genre TV"
+            ShelfKind.mixed -> genre to genre
+        }
+    }
+
+    /**
+     * Items matching every chip of the rule, in the sequence the channel's `order` wants
+     * (`inOrder`: season/episode then year; `newestFirst`: year descending; `shuffle`: library order, shuffled per day by the scheduler,
+     * or on the tape with the shows taking turns when it is episodes of two or more shows).
+     */
+    fun resolve(definition: ChannelDefinition, library: List<MediaItem>, now: Instant = Instant.now()): List<MediaItem> {
+        // A marathon whose show's copies were merged under another library's (`Duplicates`) follows it by title.
+        // ponytail: a show gone from the library hands its chip to another of the same name, if any; say so if it bites.
+        val rule = definition.rule.map { chip ->
+            if (chip !is RuleChip.series || library.any { it.seriesID == chip.id }) return@map chip
+            val moved = library.firstOrNull { it.seriesTitle == chip.title && it.seriesID != null }?.seriesID ?: return@map chip
+            RuleChip.series(id = moved, title = chip.title)
+        }
+        val items = library.filter { item -> rule.all { matches(it, item, now) } }
+        return when (definition.order) {
+            PlayOrder.shuffle -> items
+            PlayOrder.inOrder -> items.sortedWith(::episodeOrder)
+            PlayOrder.newestFirst -> items.sortedWith { a, b ->
+                compareValues(b.year ?: 0, a.year ?: 0).takeIf { it != 0 } ?: swiftCompare(b.title, a.title)
+            }
+        }
+    }
+
+    /** In order: season, episode, then year and title. */
+    internal fun episodeOrder(a: MediaItem, b: MediaItem): Int =
+        compareValues(a.season ?: 0, b.season ?: 0).takeIf { it != 0 } ?: compareValues(a.episode ?: 0, b.episode ?: 0).takeIf { it != 0 }
+            ?: compareValues(a.year ?: 0, b.year ?: 0).takeIf { it != 0 } ?: swiftCompare(a.title, b.title)
+
+    fun matches(chip: RuleChip, item: MediaItem, now: Instant = Instant.now()): Boolean = when (chip) {
+        is RuleChip.addedWithin -> item.addedAt?.let { it >= now.plusSeconds(-chip.days.toDouble() * 86_400) } ?: false
+        is RuleChip.genre -> chip.value in item.genres && !(chip.value.lowercase() in grownUpGenres && isForKids(item))
+        is RuleChip.years -> item.year?.let { it in chip.from..chip.to } ?: false
+        is RuleChip.director -> chip.name in item.directors
+        is RuleChip.actor -> chip.name in item.actors
+        is RuleChip.series -> item.seriesID == chip.id || (item.seriesID == null && item.seriesTitle == chip.title)
+        is RuleChip.year -> item.year == chip.value
+        RuleChip.movies -> item.kind == MediaItem.Kind.movie
+        RuleChip.tv -> item.kind == MediaItem.Kind.episode
+        is RuleChip.anyGenre -> item.genres.any { it in chip.genres }
+        is RuleChip.keywords -> mentions(item, chip.words)
+        RuleChip.unwatched -> !item.watched
+        RuleChip.holiday -> Holiday.isGroundhogDay(item) || Holiday.entries.any { it.has(item) }
+    }
+
+    /** Genres whose channels stay grown-up: a kids' title tagged with one (the animated Gremlins series is "Horror") is left off. */
+    internal val grownUpGenres = setOf("horror", "thriller")
+
+    /**
+     * Made for children: tagged Children, Kids or Family, rated for kids, or animated without a rating for older viewers
+     * (an adult animated horror like Love, Death & Robots is TV-MA and stays).
+     * ponytail: US ratings only; another country's rating on an animated title counts as not older.
+     */
+    internal fun isForKids(item: MediaItem): Boolean {
+        val genres = item.genres.map { it.lowercase() }.toSet()
+        val rating = item.contentRating?.uppercase()
+        if (genres.any { it in setOf("children", "kids", "family") }) return true
+        if (rating in setOf("TV-Y", "TV-Y7", "TV-Y7-FV", "TV-G", "G")) return true
+        return "animation" in genres && rating !in setOf("TV-14", "TV-MA", "PG-13", "R", "NC-17")
+    }
+
+    /** Word-start, case-insensitive search of the title and overview: "creature" takes "creatures", not "procreature". */
+    internal fun mentions(item: MediaItem, any: List<String>): Boolean {
+        val text = (item.title + " " + (item.overview ?: "")).lowercase()
+        return any.any { w ->
+            if (w.isEmpty()) return@any false   // Foundation finds no range for an empty needle
+            var from = 0
+            while (true) {
+                val r = text.indexOf(w, from)
+                if (r < 0) break
+                if (r == 0 || !Character.isLetter(text.codePointBefore(r))) return@any true
+                from = r + w.length
+            }
+            false
+        }
+    }
+
+    /**
+     * The keywords for "Creature Feature": lowercase, word-start prefixes ("werewol" takes werewolf and werewolves).
+     * "shark" alone matches loan sharks and shark-infested waters; "great white" is the one that eats people.
+     */
+    internal val monsterWords = listOf("monster", "kaiju", "godzilla", "king kong", "kong:", "creature", "werewol", "vampire", "zombie",
+        "frankenstein", "dracula", "mummy", "dinosaur", "great white", "megalodon", "gremlin", "xenomorph",
+        "kraken", "leviathan", "cryptid", "sasquatch", "bigfoot", "swamp thing")
+    /** The genres searched for those keywords: Fantasy would add Terabithia and Spirited Away; Action/Adventure adds Jurassic Park and Kong. */
+    internal val monsterGenres = listOf("Horror", "Science Fiction", "Sci-Fi", "Action", "Adventure")
+
+    /**
+     * The "what's new" channels: New Releases, New This Season, Just Added, and any channel with an "Added in the last N
+     * days" chip. They also see the items `MediaServer.recentlyAdded` found since the last full library load.
+     */
+    fun isFresh(d: ChannelDefinition): Boolean =
+        d.id in setOf("lead:new-movies", "lead:new-tv", "lead:just-added", "lead:just-added-tv") || d.rule.any { it is RuleChip.addedWithin }
+
+    /**
+     * `channels(definitions, library, now)`, with `fresh` (newly added items not yet in `library`) given to the `isFresh`
+     * channels only: every other channel keeps resolving from `library`, so its lineup for the day holds still until the next
+     * full load.
+     */
+    fun channels(definitions: List<ChannelDefinition>, library: List<MediaItem>, fresh: List<MediaItem>, now: Instant = Instant.now()): List<Channel> {
+        if (fresh.isEmpty()) return channels(definitions, library, now)
+        return channels(definitions.filter { !isFresh(it) }, library, now) + channels(definitions.filter(::isFresh), library + fresh, now)
+    }
+
+    /** Resolve definitions against the library, dropping channels with nothing to air. */
+    fun channels(definitions: List<ChannelDefinition>, library: List<MediaItem>, now: Instant = Instant.now()): List<Channel> =
+        definitions.mapNotNull { d -> resolve(d, library, now).takeIf { it.isNotEmpty() }?.let { Channel(d, it) } }
+
+    /** Convenience: automatic channels resolved. Used by tests. */
+    fun channels(from: List<MediaItem>, minItems: Int = 4): List<Channel> =
+        channels(automaticChannels(from, minItems = minItems), from)
+
+    enum class CandidateKind(val rawValue: String) { director("Director"), actor("Actor"), series("Show marathon") }
+    data class Candidate(val name: String, val id: String?, val count: Int)
+
+    /** Names with enough in the library to fill an evening, for the "New channel" picker. Sorted by count desc, then name. */
+    fun candidates(kind: CandidateKind, library: List<MediaItem>, minItems: Int = 3): List<Candidate> {
+        val counts = LinkedHashMap<String, Pair<String?, Int>>()
+        fun bump(key: String, id: String?) { val c = counts[key]; counts[key] = (c?.first ?: id) to ((c?.second ?: 0) + 1) }
+        for (item in library) {
+            when (kind) {
+                CandidateKind.director -> if (item.kind == MediaItem.Kind.movie) for (d in item.directors) bump(d, null)
+                CandidateKind.actor -> if (item.kind == MediaItem.Kind.movie) for (a in item.actors) bump(a, null)
+                CandidateKind.series -> { val t = item.seriesTitle; if (item.kind == MediaItem.Kind.episode && t != null) bump(t, item.seriesID) }
+            }
+        }
+        return counts.entries.filter { it.value.second >= minItems }
+            .map { Candidate(name = it.key, id = it.value.first, count = it.value.second) }
+            .sortedWith { a, b -> if (a.count != b.count) b.count - a.count else swiftCompare(a.name, b.name) }
+    }
+
+    internal fun decadeTag(genre: String, years: List<Int>): String {
+        val lo = years.minOrNull() ?: return genre
+        val hi = years.max()
+        // "80s" for the 1900s, "2010s" from 2000 on, so "50s–2020s" can't be read as the 1920s.
+        val d = { y: Int -> if (y < 2000) "${y % 100 / 10 * 10}s" else "${y / 10 * 10}s" }
+        return "$genre, " + (if (lo / 10 == hi / 10) d(lo) else "${d(lo)}–${d(hi)}")
+    }
+}
+
+/** FNV-1a 64 of a string seeding SplitMix64. Stable across processes and devices. */
+class SeededGenerator(seed: String) {
+    private var state: ULong = StableHash.fnv1a(seed)
+
+    fun next(): ULong {
+        state += 0x9e3779b97f4a7c15uL
+        var z = state
+        z = (z xor (z shr 30)) * 0xbf58476d1ce4e5b9uL
+        z = (z xor (z shr 27)) * 0x94d049bb133111ebuL
+        return z xor (z shr 31)
+    }
+
+    /** Swift's `RandomNumberGenerator.next(upperBound:)`: Lemire's nearly divisionless method, same draws, same result. */
+    fun next(upperBound: ULong): ULong {
+        require(upperBound != 0uL) { "upperBound cannot be zero." }
+        var random = next()
+        var low = random * upperBound
+        if (low < upperBound) {
+            val t = (0uL - upperBound) % upperBound
+            while (low < t) {
+                random = next()
+                low = random * upperBound
+            }
+        }
+        return multiplyHighUnsigned(random, upperBound)
+    }
+
+    /** Swift's `Int.random(in: 0..<until, using:)`. */
+    fun nextInt(until: Int): Int {
+        require(until > 0) { "Can't get random value with an empty range" }
+        return next(until.toULong()).toInt()
+    }
+
+    private fun multiplyHighUnsigned(a: ULong, b: ULong): ULong {
+        val aLo = a and 0xffffffffuL
+        val aHi = a shr 32
+        val bLo = b and 0xffffffffuL
+        val bHi = b shr 32
+        val lh = aLo * bHi
+        val hl = aHi * bLo
+        val mid = ((aLo * bLo) shr 32) + (lh and 0xffffffffuL) + (hl and 0xffffffffuL)
+        return aHi * bHi + (lh shr 32) + (hl shr 32) + (mid shr 32)
+    }
+}
+
+/** Swift's `shuffled(using:)`: Fisher–Yates front to back, each swap partner from `Int.random(in: 0..<remaining)`. */
+fun <T> List<T>.shuffled(using: SeededGenerator): List<T> {
+    val result = toMutableList()
+    var amount = result.size
+    var i = 0
+    while (amount > 1) {
+        val r = using.nextInt(amount)
+        amount -= 1
+        java.util.Collections.swap(result, i, i + r)
+        i += 1
+    }
+    return result
+}
+
+/** Deterministic scheduler. Same (lineup, day) → identical schedule on every device, every launch. No server state. */
+object GuideGenerator {
+    /** Guide grid resolution. Slots are (runtime + `pad`) rounded UP to a multiple of this. */
+    const val blockLength: Double = 30.0 * 60
+    /** Breathing room so a 28-minute episode isn't jammed into one block: ceil((runtime + 3 min) / 30 min) blocks. */
+    const val pad: Double = 3.0 * 60
+
+    private fun startOfDay(t: Instant, zone: ZoneId): ZonedDateTime = t.atZone(zone).toLocalDate().atStartOfDay(zone)
+
+    /**
+     * Every channel of `lineup` tiling `day` from local midnight to the next local midnight, by channel id (the Swift
+     * `schedule(lineup:day:calendar:)`). In order channels, and Shuffle channels of two or more shows' episodes (the shows
+     * take turns), run on a tape that carries on across midnight through the calendar year (`Tape`, `tileRun`); the
+     * others draw a pool per day (`tile`). Channels go in `dependencyOrder`, and each passes over a film or episode that
+     * a channel scheduled before it is airing, while anything else will do (`Busy`): a shuffle channel takes its next
+     * free item, a turns channel swaps in another show's next episode. So one can still air on two channels at once: an
+     * In order channel never gives way; a shuffle channel with nothing free airs the first it passed over, opens with its
+     * first item when another channel airs its first two, and re-picks its last slot from aired films before it repeats
+     * one; a turns channel airs a packed half hour, or an episode with no partner, where it falls. Nothing airs twice in
+     * a row (`repeatKey`), across midnight too, unless the channel has nothing else that fits: an overlap goes before a
+     * repeat. Across midnight a few still can (`tile`, `tileRun`): on a small shuffle channel, around programs half a day
+     * long or more, and where a turns channel swaps its first episode.
+     */
+    fun schedule(lineup: List<Channel>, day: Instant, calendar: ZoneId = ZoneId.systemDefault()): Map<String, List<Slot>> {
+        val start = startOfDay(day, calendar)
+        // Tile by time: a DST day is 23 or 25 hours, never assume 48 blocks.
+        // (Start of the next day, not 24h on: where a DST change skips midnight, a day starts at 1:00.)
+        val next = start.toLocalDate().plusDays(1).atStartOfDay(calendar)
+        val (year, lengths) = if (lineup.any(::isContinuous)) dayLengths(start) else 0 to emptyList<Int>()
+        // On December 31, January 1's length: the tapes look ahead to what they open the new year with (`tileRun`).
+        val jan1 = if (year != 0 && next.year != year)
+            (epoch(next.toLocalDate().plusDays(1).atStartOfDay(calendar).toInstant()) - epoch(next.toInstant())).toInt() else null
+        val busy = Busy()
+        val out = HashMap<String, List<Slot>>()
+        for (ch in dependencyOrder(lineup)) {
+            val s = scheduleOne(ch, start, next, year, lengths, jan1, busy)
+            out[ch.id] = s; busy.add(s)
+        }
+        return out
+    }
+
+    /** One channel's day on its own (no other channel in the way). */
+    fun schedule(channel: Channel, day: Instant, calendar: ZoneId = ZoneId.systemDefault()): List<Slot> =
+        schedule(listOf(channel), day, calendar)[channel.id] ?: emptyList()
+
+    private fun scheduleOne(ch: Channel, start: ZonedDateTime, end: ZonedDateTime, year: Int, lengths: List<Int>, jan1: Int?, busy: Busy): List<Slot> {
+        if (ch.items.isEmpty()) return emptyList()
+        if (isContinuous(ch)) {
+            val t = Tape(ch, year)
+            val day = (epoch(end.toInstant()) - epoch(start.toInstant())).toInt()
+            val fits = HashMap<Int, Int>()
+            for (l in lengths + day) if (l !in fits) fits[l] = t.fit(l)
+            return tileRun(t, start.toInstant(), end.toInstant(), stateAt(t, lengths, fits), fits, busy, swaps = ch.order == PlayOrder.shuffle, jan1 = jan1)
+        }
+        // A day opens with one of its pool's first two items (`tile`), so tonight's last slot steers clear of both of
+        // tomorrow's without scheduling tomorrow; of the first only when the pool has only two, where both would leave
+        // it nothing. Not an In order holiday channel: its films are the day's own.
+        val tomorrow = pool(ch, end); val two = tomorrow.take(2).map(::repeatKey)
+        val opens = if (ch.order == PlayOrder.inOrder) emptyList() else if (tomorrow.any { repeatKey(it) !in two }) two else two.take(1)
+        return tile(pool(ch, start), start.toInstant(), end.toInstant(), opens, busy)
+    }
+
+    // MARK: The tape (marathons that keep going, shows taking turns)
+
+    /** The show an episode belongs to; a film, or an episode with no show, is its own. */
+    internal fun showKey(item: MediaItem): String = item.seriesID ?: item.seriesTitle ?: item.id
+
+    /** Episodes of two or more shows: on Shuffle the shows take turns, each in order. */
+    fun takesTurns(ch: Channel): Boolean =
+        ch.items.all { it.kind == MediaItem.Kind.episode } && ch.items.map(::showKey).toSet().size >= 2
+
+    /** Runs on the tape. Never the holiday channel: its films are the day's holiday's. */
+    internal fun isContinuous(ch: Channel): Boolean =
+        RuleChip.holiday !in ch.definition.rule && (ch.order == PlayOrder.inOrder || (ch.order == PlayOrder.shuffle && takesTurns(ch)))
+
+    /** Who gives way to whom: In order channels never do, then turns channels, then shuffle and newest first, and last
+     *  the "what's new" channels and any with an Unwatched chip: their items are this device's own finds and the
+     *  signed-in user's watched state, so a new find or a finished film moves nothing before them. */
+    internal fun tier(ch: Channel): Int =
+        if (ChannelBuilder.isFresh(ch.definition) || RuleChip.unwatched in ch.definition.rule) 3 else if (!isContinuous(ch)) 2
+        else if (ch.order == PlayOrder.inOrder) 0 else 1
+
+    /** The lineup by (tier, number, id), hidden channels and channel 99 included. What a channel airs can move only the
+     *  channels after it, so the ones whose items differ by device or by user go last (`tier`). */
+    internal fun dependencyOrder(channels: List<Channel>): List<Channel> =
+        channels.map { tier(it) to it }.sortedWith { a, b ->
+            if (a.first != b.first) a.first - b.first else if (a.second.number != b.second.number) a.second.number.compareTo(b.second.number)
+            else swiftCompare(a.second.id, b.second.id)
+        }.map { it.second }
+
+    /** Whole epoch seconds (slot bounds are whole seconds); the tape and the busy index count in these. */
+    internal fun epoch(t: Instant): Long = Math.round(t.epochSeconds)
+
+    /** The channel's items as one endless tape. In order: the items as they are, round and round. Turns: show A's next
+     *  episode, then B's, then C's (shows by name), each show in order, wrapping on its own. */
+    internal class Tape(ch: Channel, year: Int) {
+        val items = ch.items
+        val len = IntArray(items.size) { slotLength(items[it]).toInt() }
+        val part = IntArray(items.size) { partLength(items[it]).toInt() }
+        val short = BooleanArray(items.size) { items[it].runtime * 2 <= len[it].toDouble() }   // tile's packing test
+        val keyID: IntArray
+        val shows: List<List<Int>>
+        val showOf: IntArray
+        /** Where January 1 starts, this year and next, seeded by the channel and the year. */
+        val p0: Int; val nextP0: Int
+        private val keyMin: IntArray
+
+        init {
+            val ids = HashMap<String, Int>()
+            keyID = IntArray(items.size) { ids.getOrPut(repeatKey(items[it])) { ids.size } }
+            keyMin = IntArray(ids.size) { Int.MAX_VALUE }
+            for (i in items.indices) keyMin[keyID[i]] = minOf(keyMin[keyID[i]], len[i])
+            shows = if (ch.order == PlayOrder.shuffle) {
+                val groups = LinkedHashMap<String, MutableList<Int>>()
+                for (i in items.indices) groups.getOrPut(showKey(items[i])) { mutableListOf() }.add(i)
+                groups.entries.map { (items[it.value[0]].seriesTitle ?: "") to it }
+                    .sortedWith { a, b -> swiftCompare(a.first, b.first).takeIf { it != 0 } ?: swiftCompare(a.second.key, b.second.key) }
+                    .map { e -> e.second.value.sortedWith { a, b -> ChannelBuilder.episodeOrder(items[a], items[b]).takeIf { it != 0 } ?: a.compareTo(b) } }
+            } else listOf(items.indices.toList())
+            showOf = IntArray(items.size)
+            for ((s, g) in shows.withIndex()) for (i in g) showOf[i] = s
+            fun p0(y: Int) = (StableHash.fnv1a(ch.id + "|" + y) % items.size.toULong()).toInt()
+            p0 = p0(year); nextP0 = p0(year + 1)
+        }
+
+        /** The item at tape position `p` (≥ 0). */
+        fun at(p: Int): Int { val s = p % shows.size; val g = shows[s]; return g[(p / shows.size) % g.size] }
+
+        /** For a day `length` seconds long: how many keys have something that fits it (0: nothing does). */
+        fun fit(length: Int) = keyMin.count { it <= length }
+    }
+
+    /** Where a tape is: the next position, and the key of what aired last (-1: nothing yet). */
+    internal class TapeState(val p: Int, val last: Int)
+
+    /** One day of the tape: the slots it airs (tape positions: the program, then any packed parts) and where it stops. */
+    internal fun walk(t: Tape, state: TapeState, day: Int, fit: Int, collect: Boolean): Pair<List<List<Int>>, TapeState> {
+        var p = state.p; var last = state.last; var used = 0
+        val plan = mutableListOf<List<Int>>()
+        if (fit == 0) { val i = t.at(p); return listOf(listOf(p)) to TapeState(p + 1, t.keyID[i]) }   // longer than the whole day: airs cut
+        while (true) {
+            val i = t.at(p)
+            if (t.len[i] > day) { p += 1; continue }
+            if (fit >= 2 && t.keyID[i] == last) { p += 1; continue }
+            if (used + t.len[i] > day) break
+            val slot = mutableListOf(p); p += 1; used += t.len[i]; last = t.keyID[i]
+            if (t.short[i] && t.items.size > 1) {
+                var room = t.len[i] - t.part[i]
+                while (true) {
+                    val j = t.at(p)
+                    // Already in this slot: an item comes round every (shows × its show's items) positions, and a slot's are consecutive.
+                    if (t.part[j] > room || t.keyID[j] == last || slot.size >= t.shows.size * t.shows[t.showOf[j]].size) break
+                    slot.add(p); room -= t.part[j]; last = t.keyID[j]; p += 1
+                }
+            }
+            if (collect) plan.add(slot)
+        }
+        return plan to TapeState(p, last)
+    }
+
+    /** The year so far: January 1 starts at `p0`, and every day since walks on from the one before.
+     *  ponytail: the chain re-walks the year on every lineup-day call; memoize the furthest (day, p, last) per channel if
+     *  an Order press stalls. */
+    internal fun stateAt(t: Tape, lengths: List<Int>, fits: Map<Int, Int>): TapeState {
+        var s = TapeState(t.p0, -1)
+        for (l in lengths) s = walk(t, s, l, fits.getValue(l), collect = false).second
+        return s
+    }
+
+    /** The day's year and the length in seconds of each day of it before `dayStart`. */
+    internal fun dayLengths(dayStart: ZonedDateTime): Pair<Int, List<Int>> {
+        val year = dayStart.year
+        var d = LocalDate.of(year, 1, 1).atStartOfDay(dayStart.zone)
+        val lengths = mutableListOf<Int>()
+        while (d.toInstant() < dayStart.toInstant()) {
+            val n = d.toLocalDate().plusDays(1).atStartOfDay(dayStart.zone)
+            lengths.add((epoch(n.toInstant()) - epoch(d.toInstant())).toInt()); d = n
+        }
+        return year to lengths
+    }
+
+    /** Tiles the day from the tape at `state` (the Swift `tileRun`): a turns channel (`swaps`) whose next episode is on
+     *  another channel airs another show's next episode from the same round instead; what the tape can't fit before
+     *  midnight is an encore of the longest program aired earlier that day, else the last slot runs on. */
+    internal fun tileRun(t: Tape, start: Instant, end: Instant, state: TapeState, fits: Map<Int, Int>, busy: Busy, swaps: Boolean, jan1: Int?): List<Slot> {
+        val s0 = epoch(start); val e0 = epoch(end)
+        val w = walk(t, state, (e0 - s0).toInt(), fits.getValue((e0 - s0).toInt()), collect = true)
+        val plan = w.first.toMutableList()
+        // What opens tomorrow: the next position. On December 31 (`jan1`: January 1's length) it is what January 1's walk
+        // places first, from the new year's `p0` with nothing aired before it; when tonight's plan ends with that too,
+        // that part goes. In a packed half hour the part before it keeps the rest of the half hour; a program's gap is
+        // filled below with an encore or by the slot before running on (neither repeats it). Not on a day of one entry,
+        // and a turns channel's January 1 can swap in another first episode (below).
+        var opener = t.keyID[t.at(w.second.p)]
+        if (jan1 != null) {
+            opener = t.keyID[t.at(walk(t, TapeState(t.nextP0, -1), jan1, t.fit(jan1), collect = true).first[0][0])]
+            if (plan.size > 1 && fits.getValue((e0 - s0).toInt()) >= 2 && t.keyID[t.at(plan.last().last())] == opener) {
+                if (plan.last().size > 1) plan[plan.size - 1] = plan.last().dropLast(1) else plan.removeAt(plan.size - 1)
+            }
+        }
+        fun key(i: Int) = repeatKey(t.items[i])
+        var cursor = s0; var prev = -1; var idx = 0
+        val slots = mutableListOf<Slot>(); val whole = mutableListOf<Int>()
+        while (idx < plan.size) {
+            var first = t.at(plan[idx][0])
+            // ponytail: a packed half hour never swaps, so two turns cartoon channels sharing a short can overlap for a
+            // few minutes. Upgrade: swap whole packs.
+            if (swaps && plan[idx].size == 1 && busy.conflicts(key(first), Busy.airs(t.items[first], cursor))) {
+                val seen = HashSet<Int>()   // shows with an entry between idx and u
+                for (u in idx + 1 until plan.size) {
+                    val showsU = plan[u].map { t.showOf[t.at(it)] }.toSet()
+                    if (t.showOf[first] in showsU) break   // never past its own show's next episode
+                    val cand = t.at(plan[u][0])
+                    if (plan[u].size == 1 && t.showOf[cand] !in seen && t.keyID[cand] != t.keyID[first] &&
+                        !busy.conflicts(key(cand), Busy.airs(t.items[cand], cursor))) {
+                        val q = plan.toMutableList(); q[idx] = plan[u]; q[u] = plan[idx]
+                        // Each moved entry against what airs before it: the entry before, or for the day's first what
+                        // the tape placed last yesterday (`state.last`, nothing on January 1). Yesterday's own swaps and
+                        // encore aside: when it ended in one, this can pass a swap that repeats it across midnight, or
+                        // refuse a good one, which can leave the blocked episode on two channels.
+                        val repeats = listOf(idx, idx + 1, u, u + 1).any { x ->
+                            x < q.size && t.keyID[t.at(q[x][0])] == (if (x == 0) state.last else t.keyID[t.at(q[x - 1].last())])
+                        }
+                        if (!repeats && !(u == plan.size - 1 && t.keyID[first] == opener)) { plan.clear(); plan.addAll(q); first = cand; break }
+                    }
+                    seen.addAll(showsU)
+                }
+            }
+            val slotEnd = minOf(cursor + t.len[first], e0)
+            val parts = plan[idx].map { t.at(it) }
+            if (parts.size == 1 && slotEnd - cursor == t.len[first].toLong()) whole.add(first)
+            for ((m, i) in parts.withIndex()) {
+                val partEnd = if (m == parts.size - 1) slotEnd else cursor + t.part[i]
+                slots.add(Slot(t.items[i], Instant.ofEpochSecond(cursor), Instant.ofEpochSecond(partEnd))); cursor = partEnd
+            }
+            prev = t.keyID[parts.last()]; idx += 1
+        }
+        if (cursor < e0) {   // the time the next one didn't fit
+            var encore: Int? = null
+            for (i in whole) {
+                if (t.len[i] <= e0 - cursor && t.keyID[i] != prev && t.keyID[i] != opener && !busy.conflicts(key(i), Busy.airs(t.items[i], cursor))) {
+                    if (encore == null || t.len[i] > t.len[encore]) encore = i   // the longest, the earliest on ties
+                }
+            }
+            if (encore != null) slots.add(Slot(t.items[encore], Instant.ofEpochSecond(cursor), end))   // its leftover is its break
+            else { val l = slots.removeAt(slots.size - 1); slots.add(Slot(l.item, l.start, end)) }
+        }
+        return slots
+    }
+
+    // MARK: One program on one channel at a time
+
+    /** The airing windows of everything placed so far today, by `repeatKey`, in whole epoch seconds. */
+    internal class Busy {
+        private val windows = HashMap<String, MutableList<LongArray>>()
+        fun conflicts(key: String, w: LongArray): Boolean = windows[key]?.any { it[0] < w[1] && w[0] < it[1] } ?: false
+        fun add(slots: List<Slot>) {
+            for (s in slots) {
+                val a = epoch(s.start)
+                windows.getOrPut(repeatKey(s.item)) { mutableListOf() }.add(longArrayOf(a, a + minOf(epoch(s.end) - a, s.item.runtime.toLong())))
+            }
+        }
+        companion object {
+            /** When `item` would air if it started at `at`. */
+            fun airs(item: MediaItem, at: Long) = longArrayOf(at, at + item.runtime.toLong())
+        }
+    }
+
+    /**
+     * What mustn't air twice in a row: the item, or for a film any copy of it (same title and year; a library often
+     * holds a 4K copy as a second item). A cut is part of the title, so two cuts are two films. Episodes go by item, so a show's next episode, or the
+     * next segment sharing its episode number, still follows.
+     * ponytail: Swift compares and hashes strings by canonical equivalence, Kotlin by UTF-16 units, so an NFC and an NFD
+     * spelling of one title (titles read from filenames) are one key in Swift and two here (`showKey` too), and that
+     * library's schedule differs from Swift's. Upgrade: normalize titles to NFC where MediaItems are built.
+     */
+    internal fun repeatKey(item: MediaItem): String =
+        if (item.kind == MediaItem.Kind.movie) "film:${item.title}|${item.year ?: 0}" else "item:${item.id}"
+
+    /** The day's play order, seeded by channel and date. The holiday channel's is the day's holiday's films only. */
+    internal fun pool(channel: Channel, day: ZonedDateTime): List<MediaItem> {
+        val rng = SeededGenerator(seed = channel.id + String.format(Locale.ROOT, "|%04d-%02d-%02d", day.year, day.monthValue, day.dayOfMonth))
+        val items = if (RuleChip.holiday in channel.definition.rule) Holiday.pick(channel.items, on = day.toInstant(), calendar = day.zone).films else channel.items
+        return when (channel.order) {
+            PlayOrder.shuffle -> items.shuffled(using = rng)
+            PlayOrder.inOrder, PlayOrder.newestFirst -> {
+                val r = (rng.next() % items.size.toULong()).toInt()
+                items.subList(r, items.size) + items.subList(0, r)
+            }
+        }
+    }
+
+    /**
+     * Tiles [start, end) from `pool` as `schedule` describes. The day opens with `pool[0]`, or `pool[1]` when another
+     * channel airs `pool[0]` at `start`, or `pool[0]` anyway when both are aired (an overlap before a repeat); one
+     * longer than the whole day counts as one of the two and can't open. `opens`: the `repeatKey`s of tomorrow's two,
+     * which the last slot and the packed parts of the last half hour steer clear of while anything else fits. With only
+     * two (`opens` is tomorrow's first), or too few for both (three), the last slot steers clear of tomorrow's first
+     * only, and repeats if another channel airs that one at midnight; a day of one program keeps its opener whatever
+     * tomorrow opens with; and when tomorrow's two are both longer than the day, the first free one that fits opens
+     * unforeseen. `opens` is empty on an In order holiday channel, which opens with its first free item. `busy`: what
+     * other channels air; an item on one of them is passed over while anything else will do, before any repeat.
+     */
+    internal fun tile(pool: List<MediaItem>, start: Instant, end: Instant, opens: List<String>, busy: Busy = Busy()): List<Slot> {
+        val slots = mutableListOf<Slot>()
+        var cursor = start
+        var next = 0
+        while (cursor < end) {
+            val previous = slots.lastOrNull()?.let { repeatKey(it.item) }
+            var pick: Int? = null
+            var blocked: Int? = null
+            var again: Int? = null
+            for (k in pool.indices) {
+                if (k == 2 && slots.isEmpty() && opens.isNotEmpty() && blocked != null) break   // the day's first slot: one of the first two
+                val i = (next + k) % pool.size
+                val slotEnd = cursor.plusSeconds(slotLength(pool[i]))
+                if (slotEnd > end) continue
+                val key = repeatKey(pool[i])
+                if (slots.isEmpty() || key != previous && (slotEnd < end || key !in opens)) {
+                    if (!busy.conflicts(key, Busy.airs(pool[i], epoch(cursor)))) { pick = i; break }
+                    if (blocked == null) blocked = i
+                } else if (again == null) again = i
+            }
+            if (pick == null) pick = blocked
+            // Only the same thing again fits: fine on a channel with nothing else that could air today (one film, or
+            // copies of it). Otherwise it's the end of the day, below.
+            val day = end.secondsSince(start)
+            if (pick == null && again != null && pool.none { repeatKey(it) != previous && slotLength(it) <= day }) pick = again
+            if (pick == null) {
+                var last = slots.removeLastOrNull()
+                // A half hour of short programs goes as a whole, so the re-picked slot starts on the half-hour grid.
+                while (last != null && last.start.secondsSince(start) % blockLength != 0.0) last = slots.removeLastOrNull() ?: break
+                if (last != null) {
+                    val window = end.secondsSince(last.start)
+                    var best = last.item   // fits by construction; a longer one that also fits leaves a shorter break
+                    val before = slots.lastOrNull()?.let { repeatKey(it.item) }
+                    if (before != null) {   // (the day's opener itself never changes)
+                        // The longest that fits and repeats neither the slot before nor tomorrow's openers: one no other
+                        // channel airs then, else one that one does (an overlap before a repeat). Too few films for that
+                        // (three): one clear of tomorrow's first at least, which opens unless another channel airs it
+                        // then. Else the slot as it was.
+                        fun longest(clear: List<String>, free: Boolean): MediaItem? {
+                            fun ok(it: MediaItem) = repeatKey(it) != before && repeatKey(it) !in clear &&
+                                !(free && busy.conflicts(repeatKey(it), Busy.airs(it, epoch(last.start))))
+                            var found: MediaItem? = if (ok(last.item)) last.item else null
+                            for (k in pool.indices) {
+                                val it = pool[(next + k) % pool.size]
+                                if (slotLength(it) <= window && slotLength(it) > (found?.let { f -> slotLength(f) } ?: 0.0) && ok(it)) found = it
+                            }
+                            return found
+                        }
+                        best = longest(opens, free = true) ?: longest(opens, free = false) ?: longest(opens.take(1), free = false) ?: last.item
+                    }
+                    slots.add(Slot(best, last.start, end))
+                } else {
+                    slots.add(Slot(pool[next], cursor, end))   // longer than the whole day
+                }
+                break
+            }
+            val slotEnd = cursor.plusSeconds(slotLength(pool[pick]))
+            // A short program (15 minutes or less: half its half hour, the pad not counted) doesn't leave the rest of it empty: the next ones in order that
+            // fit play right after it, each in its own slot, the way cartoon blocks did. Nothing crosses the half hour.
+            val parts = mutableListOf(pool[pick])
+            var used = partLength(pool[pick])
+            next = (pick + 1) % pool.size
+            if (pool[pick].runtime <= slotEnd.secondsSince(cursor) / 2) {
+                while (pool.size > 1) {
+                    val it = pool[next]
+                    if (used + partLength(it) > slotEnd.secondsSince(cursor) || parts.any { p -> p.id == it.id } ||
+                        repeatKey(it) == repeatKey(parts.last()) || !(slotEnd < end || repeatKey(it) !in opens) ||
+                        busy.conflicts(repeatKey(it), Busy.airs(it, epoch(cursor) + used.toLong()))) break
+                    parts.add(it); used += partLength(it); next = (next + 1) % pool.size
+                }
+            }
+            for ((n, it) in parts.withIndex()) {   // the last one keeps whatever is left of the half hour as its break
+                val partEnd = if (n == parts.size - 1) slotEnd else cursor.plusSeconds(partLength(it))
+                slots.add(Slot(it, cursor, partEnd))
+                cursor = partEnd
+            }
+        }
+        return slots
+    }
+
+    /** A packed program's slot: its runtime in whole seconds, so the next one starts as it ends (no break in between). */
+    internal fun partLength(item: MediaItem): Double = maxOf(1.0, floor(item.runtime))
+
+    /** Slots on `channel` intersecting [from, to]. Spans days as needed. */
+    fun schedule(channel: Channel, from: Instant, to: Instant, calendar: ZoneId = ZoneId.systemDefault()): List<Slot> {
+        val slots = mutableListOf<Slot>()
+        var day = startOfDay(from, calendar)
+        while (day.toInstant() < to) {
+            slots += schedule(channel, day.toInstant(), calendar)
+            day = day.plusDays(1)
+        }
+        return slots.filter { it.end > from && it.start < to }
+    }
+
+    /** The slot containing `at` on `channel`. */
+    fun slot(on: Channel, at: Instant, calendar: ZoneId = ZoneId.systemDefault()): Slot? =
+        schedule(on, at, calendar).firstOrNull { it.start <= at && at < it.end }
+
+    /**
+     * Swift `slot(on:startingAt:)`. The slot by its exact start (what `ProgramKey` stores), if the generator still produces it.
+     * Sub-second tolerance so a start that went through JSON (persisted key) still matches.
+     */
+    fun slotStartingAt(on: Channel, startingAt: Instant, calendar: ZoneId = ZoneId.systemDefault()): Slot? =
+        schedule(on, startingAt, calendar).firstOrNull { abs(it.start.secondsSince(startingAt)) < 1 }
+
+    /** later: before start · live: item playing · break: item over, slot not · past: slot over. */
+    fun status(of: Slot, at: Instant): ProgramStatus {
+        if (at < of.start) return ProgramStatus.later
+        if (at >= of.end) return ProgramStatus.past
+        return if (at >= of.itemEnd) ProgramStatus.`break` else ProgramStatus.live
+    }
+
+    fun slotLength(item: MediaItem): Double {
+        // Channel 99's programs fill their slots exactly: no pad, so the scramble never drops into a station break.
+        val padded = if (item.id.startsWith(Channel.scrambledID)) item.runtime else item.runtime + pad
+        return maxOf(1.0, ceil(padded / blockLength)) * blockLength
+    }
+}
+
+/**
+ * The holiday channel's calendar (US holidays). Each day airs the films of the nearest holiday that has at least
+ * `minFilms` of them: the one whose season the day falls in (all October is Halloween, Christmas runs from the day after
+ * Thanksgiving), else the one whose season is closest. Groundhog Day is the one-day exception: the film, back to back.
+ */
+enum class Holiday(val rawValue: String) {
+    newYear("New Year’s"), valentines("Valentine’s Day"), stPatricks("St. Patrick’s Day"), easter("Easter"),
+    july4("Fourth of July"), halloween("Halloween"), thanksgiving("Thanksgiving"), christmas("Christmas");
+
+    /** Days before the holiday that its season starts. Where two seasons overlap, the nearer holiday has the day. */
+    internal val lead: Int
+        get() = when (this) {
+            newYear -> 6            // from the day after Christmas
+            valentines -> 13
+            stPatricks, easter, july4 -> 7
+            halloween -> 30         // all October
+            thanksgiving -> 27      // all November up to it, even on the 28th
+            christmas -> 33         // from the day after Thanksgiving, the 22nd at the earliest
+        }
+
+    /** Its (month, day) in `year`. */
+    internal fun date(year: Int): Pair<Int, Int> = when (this) {
+        newYear -> 1 to 1
+        valentines -> 2 to 14
+        stPatricks -> 3 to 17
+        easter -> easter(year)
+        july4 -> 7 to 4
+        halloween -> 10 to 31
+        thanksgiving -> 11 to (22 + (11 - weekday(year, 11, 1)) % 7)   // the fourth Thursday
+        christmas -> 12 to 25
+    }
+
+    /** Word starts in a film's title or overview that make it this holiday's (as `ChannelBuilder.mentions` reads them). */
+    internal val words: List<String>
+        get() = when (this) {
+            newYear -> listOf("new year", "auld lang syne")
+            valentines -> listOf("valentine")
+            stPatricks -> listOf("st. patrick", "st patrick", "saint patrick", "leprechaun", "ireland")
+            easter -> listOf("easter bunny", "easter egg", "easter parade", "easter sunday", "jesus", "ten commandments", "ben-hur")
+            july4 -> listOf("fourth of july", "4th of july", "july 4", "july fourth", "independence day")
+            halloween -> listOf("halloween", "trick or treat", "trick-or-treat")
+            thanksgiving -> listOf("thanksgiving")
+            christmas -> listOf("christmas", "xmas", "santa claus", "north pole", "yuletide", "scrooge", "grinch", "nutcracker", "kris kringle", "reindeer")
+        }
+
+    /** Genres that make a film this holiday's: a date for Valentine's, a scare for Halloween (not a kids' one: `RuleChip.genre`). */
+    internal val genres: List<String>
+        get() = when (this) {
+            valentines -> listOf("Romance")
+            halloween -> listOf("Horror")
+            else -> emptyList()
+        }
+
+    /** A film for this holiday. */
+    internal fun has(item: MediaItem): Boolean =
+        item.kind == MediaItem.Kind.movie && (ChannelBuilder.mentions(item, words) || genres.any { ChannelBuilder.matches(RuleChip.genre(it), item) })
+
+    /** What the holiday channel airs on a day, and its holiday's name (Swift's `(name, films)` tuple). */
+    data class Pick(val name: String, val films: List<MediaItem>)
+
+    companion object {
+        /** Fewer and the holiday sits the year out: four films are about as few as a day can repeat. */
+        const val minFilms = 4
+        const val groundhogDay = "Groundhog Day"
+
+        /** Groundhog Day's own film, by its title, any cut of it ("Groundhog Day (Remastered)": `MediaItem.title(title, edition)`). */
+        internal fun isGroundhogDay(item: MediaItem): Boolean {
+            val t = item.title.lowercase()
+            return item.kind == MediaItem.Kind.movie && (t == "groundhog day" || t.startsWith("groundhog day ("))
+        }
+
+        /**
+         * What the holiday channel airs on the day of `on` in `calendar`, and its holiday's name: on February 2 the film
+         * Groundhog Day if `films` has it, else the nearest holiday's films. All of `films` if no holiday has `minFilms`
+         * (then there is no channel).
+         */
+        internal fun pick(films: List<MediaItem>, on: Instant, calendar: ZoneId): Pick {
+            val c = on.atZone(calendar)
+            if (c.monthValue == 2 && c.dayOfMonth == 2) {
+                val g = films.filter { isGroundhogDay(it) }
+                if (g.isNotEmpty()) return Pick(groundhogDay, g)
+            }
+            val y = c.year
+            val today = dayNumber(y, c.monthValue, c.dayOfMonth)
+            // In its season (0), else how far from it; then the nearer holiday (halfway between two seasons, the one just gone:
+            // its season ends on its day). No two holidays tie, so nearest first and the first with enough films has the day:
+            // only the holidays tried get their films sorted out.
+            val byKey = compareBy<Pair<Int, Int>>({ it.first }, { it.second })
+            fun key(h: Holiday): Pair<Int, Int> = (y - 1..y + 1).map { year ->
+                val (m, d) = h.date(year)
+                val at = dayNumber(year, m, d)
+                val start = at - h.lead
+                Pair(if (today < start) start - today else maxOf(0, today - at), abs(at - today))
+            }.minWith(byKey)
+            for (h in entries.sortedWith(compareBy(byKey, ::key))) {
+                val mine = films.filter(h::has)
+                if (mine.size >= minFilms) return Pick(h.rawValue, mine)
+            }
+            return Pick("Holiday", films)
+        }
+
+        /** Days from 1970-01-01 to a calendar date (`LocalDate.toEpochDay`, the same count as Swift's days_from_civil). */
+        internal fun dayNumber(y: Int, m: Int, d: Int): Int = LocalDate.of(y, m, d).toEpochDay().toInt()
+
+        /** 0 = Sunday. */
+        internal fun weekday(y: Int, m: Int, d: Int): Int = LocalDate.of(y, m, d).dayOfWeek.value % 7
+
+        /** Western Easter Sunday as (month, day) (the anonymous Gregorian algorithm). */
+        internal fun easter(y: Int): Pair<Int, Int> {
+            val a = y % 19; val b = y / 100; val c = y % 100; val d = b / 4; val e = b % 4; val f = (b + 8) / 25; val g = (b - f + 1) / 3
+            val h = (19 * a + b - d - g + 15) % 30; val i = c / 4; val k = c % 4; val l = (32 + 2 * e + 2 * i - h - k) % 7
+            val m = (a + 11 * h + 22 * l) / 451
+            val n = h + l - 7 * m + 114
+            return n / 31 to n % 31 + 1
+        }
+    }
+}

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- The whole app: the model (the web's AppModel port) and the 1920x1080 stage its views draw. -->
+<component name="MainScene" extends="Scene">
+  <interface>
+    <field id="launchArgs" type="assocarray" onChange="onLaunchArgs" />
+    <field id="deepLink" type="assocarray" onChange="onDeepLink" />
+    <field id="lowMemory" type="boolean" alwaysNotify="true" onChange="onLowMemory" />
+  </interface>
+  <script type="text/brightscript" uri="pkg:/components/core/Lang.brs" />
+  <script type="text/brightscript" uri="pkg:/components/core/Time.brs" />
+  <script type="text/brightscript" uri="pkg:/components/core/Models.brs" />
+  <script type="text/brightscript" uri="pkg:/components/core/GuideGenerator.brs" />
+  <script type="text/brightscript" uri="pkg:/components/core/DemoServer.brs" />
+  <script type="text/brightscript" uri="pkg:/components/core/TitleSearch.brs" />
+  <script type="text/brightscript" uri="pkg:/components/core/Duplicates.brs" />
+  <script type="text/brightscript" uri="pkg:/components/app/Ui.brs" />
+  <script type="text/brightscript" uri="pkg:/components/app/Store.brs" />
+  <script type="text/brightscript" uri="pkg:/components/app/Model.brs" />
+  <script type="text/brightscript" uri="pkg:/components/app/Server.brs" />
+  <script type="text/brightscript" uri="pkg:/components/app/GuideModel.brs" />
+  <script type="text/brightscript" uri="pkg:/components/app/WatchModel.brs" />
+  <script type="text/brightscript" uri="pkg:/components/app/MenusModel.brs" />
+  <script type="text/brightscript" uri="pkg:/components/app/OnboardingModel.brs" />
+  <script type="text/brightscript" uri="pkg:/components/app/Keyboard.brs" />
+  <script type="text/brightscript" uri="pkg:/components/app/GuideView.brs" />
+  <script type="text/brightscript" uri="pkg:/components/app/WatchView.brs" />
+  <script type="text/brightscript" uri="pkg:/components/app/OverlayViews.brs" />
+  <script type="text/brightscript" uri="pkg:/components/app/ScreenViews.brs" />
+  <script type="text/brightscript" uri="pkg:/components/app/OnboardingViews.brs" />
+  <script type="text/brightscript" uri="pkg:/components/MainScene.brs" />
+</component>

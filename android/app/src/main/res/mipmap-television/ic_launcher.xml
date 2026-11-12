@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- TVs keep the plain square: their launchers show the banner, and Fire OS 7 does not support adaptive icons. The UI
+     mode outranks the density and the API level when Android picks a resource, so this wins over mipmap-anydpi-v26 there. -->
+<bitmap xmlns:android="http://schemas.android.com/apk/res/android" android:src="@mipmap/ic_launcher_foreground" />

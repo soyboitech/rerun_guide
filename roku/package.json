@@ -1,0 +1,20 @@
+{
+  "name": "rerun-guide-roku",
+  "private": true,
+  "scripts": {
+    "build": "node build.mjs build",
+    "test": "node build.mjs test",
+    "deploy": "node build.mjs deploy",
+    "sim": "node build.mjs sim"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "brighterscript": "0.73.8",
+    "brs-engine": "2.6.2",
+    "brs-node": "2.6.2",
+    "brs-scenegraph": "0.6.2",
+    "roku-deploy": "3.18.4"
+  }
+}

@@ -1,0 +1,17 @@
+title=Rerun Guide
+major_version=1
+minor_version=1
+build_version=1
+mm_icon_focus_fhd=pkg:/images/icon-fhd.png
+mm_icon_focus_hd=pkg:/images/icon-hd.png
+splash_screen_fhd=pkg:/images/splash-fhd.png
+splash_screen_hd=pkg:/images/splash-hd.png
+splash_screen_sd=pkg:/images/splash-sd.png
+splash_color=#14110F
+splash_min_time=0
+ui_resolutions=fhd
+rsg_version=1.3
+supports_input_launch=1
+# 1: the Plex and Emby link codes and Jellyfin Quick Connect (sideloaded builds). Certification 2.2 wants sign-in on
+# the device itself, so a store build sets 0 and signs in with a password.
+link_codes=1

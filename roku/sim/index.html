@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Rerun Guide Roku sim</title>
+<!-- Development only (`npm run sim`): the BrightScript Simulation Engine runs dist/rerun-guide.zip in this page, so the
+     channel can be looked at without a Roku. Arrows, Enter = OK, Backspace = Back, Space = Play, Home = Home. Not a
+     device: the engine's SceneGraph is a beta, so check anything that matters on a Roku. -->
+<style>
+  html, body { margin: 0; background: #000; overflow: hidden; }
+  #display { width: 100vw; height: 56.25vw; max-height: 100vh; max-width: 177.78vh; display: block; }
+  #player { display: none; }
+</style>
+</head>
+<body>
+<canvas id="display" width="1920" height="1080"></canvas>
+<video id="player" crossorigin="anonymous" playsinline></video>
+<script src="lib/brs.api.js"></script>
+<script>
+  // ?keys=down,down,OK,wait:1500,right replays remote keys after launch (for screenshots), as the web build's ?keys.
+  (async () => {
+    // The device's common: volume, handed over up front: initialize() would fetch it without waiting.
+    const assets = await (await fetch('assets/common.zip')).arrayBuffer()
+    // The SceneGraph extension (lib/brs-sg.js, next to the worker), loaded for apps with pkg:/components/.
+    const extensions = new Map([['brs-scenegraph', './brs-sg.js']])
+    await brs.initialize({ displayMode: '1080p', locale: 'en_US', assets, extensions }, { debugToConsole: true })
+    const zip = await (await fetch('rerun-guide.zip', { cache: 'no-store' })).arrayBuffer()
+    const deepLink = new Map(new URLSearchParams(location.search).entries())
+    deepLink.delete('keys')
+    brs.execute('rerun-guide.zip', zip, { clearDisplayOnExit: false }, deepLink)
+    const keys = new URLSearchParams(location.search).get('keys')
+    if (keys) {
+      await new Promise(r => setTimeout(r, 3000))
+      for (const k of keys.split(',')) {
+        if (k.startsWith('wait:')) await new Promise(r => setTimeout(r, Number(k.slice(5))))
+        else { brs.sendKeyPress(k, 150); await new Promise(r => setTimeout(r, 400)) }
+      }
+    }
+  })()
+</script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+{
+  "rootDir": "dist/pkg",
+  "files": ["manifest", "source/**/*", "components/**/*", "images/**/*", "fonts/**/*"],
+  "createPackage": false,
+  "copyToStaging": false,
+  "retainStagingDir": false,
+  "diagnosticFilters": []
+}

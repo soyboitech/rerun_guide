@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Phones and tablets: the launcher's own shape, full bleed, instead of a small square on a white disc (adaptive icons).
+     The art is the 108 dp square, inset so its farthest point (the set's bottom corners, 43.2 dp from the center) sits
+     inside the 33 dp safe zone that every mask shows; the background carries the art's own backdrop on past its edge. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background><shape><gradient android:angle="270" android:startColor="#1f1916" android:endColor="#0f0c0a" /></shape></background>
+    <foreground><inset android:drawable="@mipmap/ic_launcher_foreground" android:inset="12%" /></foreground>
+</adaptive-icon>
